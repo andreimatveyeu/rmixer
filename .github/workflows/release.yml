@@ -33,4 +33,3 @@ jobs:
         with:
           files: target/release/rmixer
           generate_release_notes: true
-I
