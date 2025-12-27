@@ -1,0 +1,47 @@
+client_name: rMixer
+inputs:
+- name: Mic
+  ports:
+  - mic_in
+  volume_db: -22.0
+- name: Music
+  ports:
+  - music_in_L
+  - music_in_R
+  volume_db: 0.0
+- name: SFX
+  ports:
+  - sfx_in_L
+  - sfx_in_R
+  volume_db: 0.0
+- name: SFX2
+  ports:
+  - sfx2_in_L
+  - sfx2_in_R
+  volume_db: 0.0
+- name: SFX3
+  ports:
+  - sfx3_in_L
+  - sfx3_in_R
+  volume_db: 0.0
+- name: SFX4
+  ports:
+  - sfx4_in_L
+  - sfx4_in_R
+  volume_db: 0.0
+- name: SFX5
+  ports:
+  - sfx5_in_L
+  - sfx5_in_R
+  volume_db: 0.0
+outputs:
+- name: Main
+  ports:
+  - main_out_L
+  - main_out_R
+  volume_db: 0.0
+- name: Monitor
+  ports:
+  - monitor_out_L
+  - monitor_out_R
+  volume_db: -15.5
