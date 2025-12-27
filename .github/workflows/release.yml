@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - "[0-9]*.[0-9]*.[0-9]*"
 
 permissions:
   contents: write
@@ -33,3 +33,4 @@ jobs:
         with:
           files: target/release/rmixer
           generate_release_notes: true
+I
