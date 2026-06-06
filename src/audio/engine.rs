@@ -5,7 +5,7 @@
 //! Works with PipeWire's JACK compatibility layer.
 
 use anyhow::{Context, Result};
-use jack::{AudioIn, AudioOut, Client, ClientOptions, Control, Port, ProcessScope};
+use jack::{AudioIn, AudioOut, Client, ClientOptions, Control, Frames, Port, ProcessScope};
 use rtrb::{Consumer, Producer, RingBuffer};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -32,6 +32,9 @@ pub struct AudioEngine {
 
     /// Flag to signal the audio thread to quit
     quit_flag: Arc<AtomicBool>,
+
+    /// Set when the JACK server shuts the client down
+    dead_flag: Arc<AtomicBool>,
 }
 
 impl AudioEngine {
@@ -42,6 +45,7 @@ impl AudioEngine {
         let (control_producer, control_consumer) = RingBuffer::new(CONTROL_RING_BUFFER_SIZE);
 
         let quit_flag = Arc::new(AtomicBool::new(false));
+        let dead_flag = Arc::new(AtomicBool::new(false));
 
         // Create JACK client
         let (client, _status) = Client::new(&config.client_name, ClientOptions::NO_START_SERVER)
@@ -101,6 +105,14 @@ impl AudioEngine {
         let input_port_counts: Vec<usize> = config.inputs.iter().map(|c| c.port_count()).collect();
         let output_port_counts: Vec<usize> = config.outputs.iter().map(|c| c.port_count()).collect();
 
+        // Pre-allocate one local mix buffer per output port so the process
+        // callback never reads a JACK input buffer and writes a JACK output
+        // buffer at the same time (JACK may alias them for zero-copy).
+        let buffer_size = client.buffer_size() as usize;
+        let mix_buffers: Vec<Vec<f32>> = (0..output_ports.len())
+            .map(|_| vec![0.0; buffer_size])
+            .collect();
+
         // Create process handler
         let process_handler = ProcessHandler {
             input_ports,
@@ -108,13 +120,16 @@ impl AudioEngine {
             input_port_counts,
             output_port_counts,
             mixer_state,
+            mix_buffers,
             meter_producer,
             control_consumer,
             quit_flag: quit_flag.clone(),
         };
 
         // Create notification handler
-        let notifications = Notifications;
+        let notifications = Notifications {
+            dead_flag: dead_flag.clone(),
+        };
 
         // Activate client
         let async_client = client
@@ -128,14 +143,19 @@ impl AudioEngine {
             control_producer,
             meter_consumer,
             quit_flag,
+            dead_flag,
         })
     }
 
-    /// Send a control message to the audio thread
-    pub fn send_control(&mut self, msg: ControlMsg) -> Result<()> {
-        self.control_producer
-            .push(msg)
-            .map_err(|_| anyhow::anyhow!("Control message queue full"))
+    /// Send a control message to the audio thread.
+    ///
+    /// Failures are logged rather than fatal: the queue can only fill up if
+    /// the audio thread stopped draining it (e.g. the JACK client died), and
+    /// dropping a UI control message is harmless in that situation.
+    pub fn send_control(&mut self, msg: ControlMsg) {
+        if self.control_producer.push(msg).is_err() {
+            log::warn!("Control message queue full; dropping message (audio engine stalled?)");
+        }
     }
 
     /// Try to receive meter data from the audio thread
@@ -143,10 +163,15 @@ impl AudioEngine {
         self.meter_consumer.pop().ok()
     }
 
+    /// Returns true if the JACK server has shut this client down
+    pub fn is_dead(&self) -> bool {
+        self.dead_flag.load(Ordering::Relaxed)
+    }
+
     /// Request the audio engine to quit
     pub fn quit(&mut self) {
         self.quit_flag.store(true, Ordering::SeqCst);
-        let _ = self.send_control(ControlMsg::Quit);
+        self.send_control(ControlMsg::Quit);
     }
 }
 
@@ -157,10 +182,14 @@ impl Drop for AudioEngine {
 }
 
 /// JACK notification handler
-struct Notifications;
+struct Notifications {
+    /// Set when the server shuts the client down, so the UI can report it
+    dead_flag: Arc<AtomicBool>,
+}
 
 impl jack::NotificationHandler for Notifications {
     unsafe fn shutdown(&mut self, _status: jack::ClientStatus, reason: &str) {
+        self.dead_flag.store(true, Ordering::SeqCst);
         log::error!("JACK client shutdown: {}", reason);
     }
 
@@ -175,12 +204,48 @@ impl jack::NotificationHandler for Notifications {
     }
 }
 
+/// Get an input port's buffer as a slice, or `None` if JACK returned no
+/// buffer (which can happen transiently while ports are being connected or
+/// disconnected, especially under PipeWire's JACK layer).
+fn input_buffer<'a>(port: &'a Port<AudioIn>, ps: &'a ProcessScope) -> Option<&'a [f32]> {
+    let n_frames = ps.n_frames() as usize;
+    // SAFETY: inside the process callback JACK guarantees a non-null buffer
+    // is valid for `n_frames` samples; the lifetime is tied to both the port
+    // borrow and the process scope. This mirrors `Port::as_slice` but adds
+    // the null check that the jack crate omits.
+    unsafe {
+        let ptr = port.buffer(ps.n_frames()) as *const f32;
+        if ptr.is_null() {
+            None
+        } else {
+            Some(std::slice::from_raw_parts(ptr, n_frames))
+        }
+    }
+}
+
+/// Get an output port's buffer as a mutable slice, or `None` if JACK
+/// returned no buffer (see [`input_buffer`]).
+fn output_buffer<'a>(port: &'a mut Port<AudioOut>, ps: &'a ProcessScope) -> Option<&'a mut [f32]> {
+    let n_frames = ps.n_frames() as usize;
+    // SAFETY: as above, plus exclusivity: we hold the only `&mut` borrow of
+    // this port, each output port has a distinct buffer, and no input buffer
+    // slice is alive while output buffers are written (see `process`).
+    unsafe {
+        let ptr = port.buffer(ps.n_frames()) as *mut f32;
+        if ptr.is_null() {
+            None
+        } else {
+            Some(std::slice::from_raw_parts_mut(ptr, n_frames))
+        }
+    }
+}
+
 /// JACK process handler - runs in the real-time audio thread
 struct ProcessHandler {
     /// Input ports
     input_ports: Vec<Port<AudioIn>>,
 
-    /// Output ports  
+    /// Output ports
     output_ports: Vec<Port<AudioOut>>,
 
     /// Number of ports per input channel
@@ -191,6 +256,11 @@ struct ProcessHandler {
 
     /// Mixer state with gains, mute, solo
     mixer_state: MixerState,
+
+    /// Local mix buffer per output port. Inputs are accumulated here first,
+    /// then copied to the JACK output buffers, so JACK input and output
+    /// buffers are never borrowed at the same time.
+    mix_buffers: Vec<Vec<f32>>,
 
     /// Producer for sending meter data to UI
     meter_producer: Producer<MeterData>,
@@ -260,21 +330,26 @@ impl jack::ProcessHandler for ProcessHandler {
             return Control::Quit;
         }
 
-        let any_soloed = self.mixer_state.any_input_soloed();
+        let n_frames = ps.n_frames() as usize;
 
-        // First, zero all output buffers
-        for port in &mut self.output_ports {
-            let out = port.as_mut_slice(ps);
-            for s in out.iter_mut() {
-                *s = 0.0;
+        // Zero the local mix buffers. They are sized by `buffer_size()`, so
+        // the resize is a safety net that should never allocate in practice.
+        for buf in &mut self.mix_buffers {
+            if buf.len() < n_frames {
+                buf.resize(n_frames, 0.0);
             }
+            buf[..n_frames].fill(0.0);
         }
 
-        // Process inputs and mix to outputs
+        let any_soloed = self.mixer_state.any_input_soloed();
+
+        // Phase 1: read inputs, meter them, and accumulate into the local
+        // mix buffers. Each JACK input buffer is fetched exactly once per
+        // cycle, and no JACK output buffer is touched in this phase.
         let mut in_port_idx = 0;
         for (ch_idx, &port_count) in self.input_port_counts.iter().enumerate() {
             let input_state = &self.mixer_state.inputs[ch_idx];
-            
+
             // Calculate effective input gain
             let input_gain = if input_state.muted {
                 0.0
@@ -288,36 +363,39 @@ impl jack::ProcessHandler for ProcessHandler {
 
             // Process each port of this input channel
             for p in 0..port_count {
-                let in_samples = self.input_ports[in_port_idx].as_slice(ps);
+                let Some(in_samples) = input_buffer(&self.input_ports[in_port_idx], ps) else {
+                    // Buffer unavailable (port renegotiation in progress)
+                    in_port_idx += 1;
+                    continue;
+                };
                 peaks[p] = Self::compute_peak(in_samples);
 
-                // Mix this input to all outputs
-                let mut out_port_idx = 0;
-                for (out_ch_idx, &out_port_count) in self.output_port_counts.iter().enumerate() {
-                    let output_state = &self.mixer_state.outputs[out_ch_idx];
-                    let output_gain = output_state.get_linear_gain();
+                if input_gain != 0.0 {
+                    // Accumulate this input into the mix buffer of every
+                    // output port it maps to
+                    let mut out_port_idx = 0;
+                    for &out_port_count in self.output_port_counts.iter() {
+                        for out_p in 0..out_port_count {
+                            // Determine which input port maps to this output port
+                            // For mono input -> stereo output: use same input for both
+                            // For stereo input -> stereo output: use matching channels
+                            let use_this_input = if port_count == 1 {
+                                // Mono input goes to all output ports
+                                true
+                            } else {
+                                // Stereo input: left->left, right->right
+                                p == out_p || (p == 0 && out_p >= port_count)
+                            };
 
-                    for out_p in 0..out_port_count {
-                        // Determine which input port maps to this output port
-                        // For mono input -> stereo output: use same input for both
-                        // For stereo input -> stereo output: use matching channels
-                        let use_this_input = if port_count == 1 {
-                            // Mono input goes to all output ports
-                            true
-                        } else {
-                            // Stereo input: left->left, right->right
-                            p == out_p || (p == 0 && out_p >= port_count)
-                        };
-
-                        if use_this_input {
-                            let out_samples = self.output_ports[out_port_idx].as_mut_slice(ps);
-                            let combined_gain = input_gain * output_gain;
-                            
-                            for (out_s, in_s) in out_samples.iter_mut().zip(in_samples.iter()) {
-                                *out_s += in_s * combined_gain;
+                            if use_this_input {
+                                let mix = &mut self.mix_buffers[out_port_idx];
+                                for (m, in_s) in mix[..n_frames].iter_mut().zip(in_samples.iter())
+                                {
+                                    *m += in_s * input_gain;
+                                }
                             }
+                            out_port_idx += 1;
                         }
-                        out_port_idx += 1;
                     }
                 }
 
@@ -334,15 +412,27 @@ impl jack::ProcessHandler for ProcessHandler {
             let _ = self.meter_producer.push(meter);
         }
 
-        // Calculate and send output meters
+        // Phase 2: apply output gains, copy the mix buffers to the JACK
+        // output buffers, and meter the result. Each JACK output buffer is
+        // fetched exactly once per cycle, and no input slice is alive here.
         let num_inputs = self.mixer_state.inputs.len();
         let mut out_port_idx = 0;
         for (ch_idx, &port_count) in self.output_port_counts.iter().enumerate() {
+            let output_gain = self.mixer_state.outputs[ch_idx].get_linear_gain();
             let mut peaks = [0.0f32; 2];
-            
+
             for p in 0..port_count {
-                let out_samples = self.output_ports[out_port_idx].as_mut_slice(ps);
-                peaks[p] = Self::compute_peak(out_samples);
+                let mix = &self.mix_buffers[out_port_idx];
+                if let Some(out_samples) = output_buffer(&mut self.output_ports[out_port_idx], ps)
+                {
+                    let mut peak = 0.0f32;
+                    for (out_s, m) in out_samples.iter_mut().zip(mix[..n_frames].iter()) {
+                        let v = m * output_gain;
+                        *out_s = v;
+                        peak = peak.max(v.abs());
+                    }
+                    peaks[p] = peak;
+                }
                 out_port_idx += 1;
             }
 
@@ -355,6 +445,15 @@ impl jack::ProcessHandler for ProcessHandler {
             let _ = self.meter_producer.push(meter);
         }
 
+        Control::Continue
+    }
+
+    fn buffer_size(&mut self, _: &Client, size: Frames) -> Control {
+        // Non-realtime callback: resize the local mix buffers so `process`
+        // never has to allocate
+        for buf in &mut self.mix_buffers {
+            buf.resize(size as usize, 0.0);
+        }
         Control::Continue
     }
 }

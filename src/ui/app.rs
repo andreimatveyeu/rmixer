@@ -33,6 +33,10 @@ const PEAK_HOLD_DURATION: f32 = 5.0;
 /// Target frame rate
 const TARGET_FPS: u64 = 60;
 
+/// How long the meter stream may be silent before the audio engine is
+/// considered stalled (it normally sends meter data every process cycle)
+const ENGINE_STALL_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Selection type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectionType {
@@ -59,6 +63,9 @@ pub struct App {
 
     /// Last frame time
     last_frame: Instant,
+
+    /// When meter data was last received from the audio thread
+    last_meter_update: Instant,
 
     /// Client name for display
     client_name: String,
@@ -105,7 +112,7 @@ impl App {
         // Send initial volume levels to audio thread
         for (i, c) in config.inputs.iter().enumerate() {
             if let Some(vol) = c.volume_db {
-                let _ = audio_engine.send_control(ControlMsg::SetInputVolume {
+                audio_engine.send_control(ControlMsg::SetInputVolume {
                     channel: i,
                     volume_db: vol.clamp(-60.0, 12.0),
                 });
@@ -113,7 +120,7 @@ impl App {
         }
         for (i, c) in config.outputs.iter().enumerate() {
             if let Some(vol) = c.volume_db {
-                let _ = audio_engine.send_control(ControlMsg::SetOutputVolume {
+                audio_engine.send_control(ControlMsg::SetOutputVolume {
                     channel: i,
                     volume_db: vol.clamp(-60.0, 12.0),
                 });
@@ -127,6 +134,7 @@ impl App {
             selection_type: SelectionType::Input,
             should_quit: false,
             last_frame: Instant::now(),
+            last_meter_update: Instant::now(),
             client_name,
             config,
         })
@@ -189,7 +197,7 @@ impl App {
             if event::poll(timeout)? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
-                        self.handle_key(key.code)?;
+                        self.handle_key(key.code);
                     }
                 }
             }
@@ -203,6 +211,7 @@ impl App {
     /// Process meter updates from the audio thread
     fn process_meter_updates(&mut self) {
         while let Some(meter) = self.audio_engine.try_recv_meter() {
+            self.last_meter_update = Instant::now();
             let num_inputs = self.mixer_state.inputs.len();
 
             if meter.channel_index < num_inputs {
@@ -221,7 +230,7 @@ impl App {
     }
 
     /// Handle keyboard input
-    fn handle_key(&mut self, code: KeyCode) -> Result<()> {
+    fn handle_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.should_quit = true;
@@ -233,26 +242,25 @@ impl App {
                 self.select_next();
             }
             KeyCode::Up => {
-                self.adjust_volume(VOLUME_STEP_DB)?;
+                self.adjust_volume(VOLUME_STEP_DB);
             }
             KeyCode::Down => {
-                self.adjust_volume(-VOLUME_STEP_DB)?;
+                self.adjust_volume(-VOLUME_STEP_DB);
             }
             KeyCode::Char('m') => {
-                self.toggle_mute()?;
+                self.toggle_mute();
             }
             KeyCode::Char('s') => {
-                self.toggle_solo()?;
+                self.toggle_solo();
             }
             KeyCode::Char('0') => {
-                self.reset_volume_to_zero()?;
+                self.reset_volume_to_zero();
             }
             KeyCode::Tab => {
                 self.toggle_section();
             }
             _ => {}
         }
-        Ok(())
     }
 
     /// Select the previous channel
@@ -338,7 +346,7 @@ impl App {
     }
 
     /// Adjust volume of the selected channel
-    fn adjust_volume(&mut self, delta: f32) -> Result<()> {
+    fn adjust_volume(&mut self, delta: f32) {
         match self.selection_type {
             SelectionType::Input => {
                 if self.selected_channel < self.mixer_state.inputs.len() {
@@ -347,7 +355,7 @@ impl App {
                     self.audio_engine.send_control(ControlMsg::SetInputVolume {
                         channel: self.selected_channel,
                         volume_db: channel.volume_db,
-                    })?;
+                    });
                 }
             }
             SelectionType::Output => {
@@ -357,15 +365,14 @@ impl App {
                     self.audio_engine.send_control(ControlMsg::SetOutputVolume {
                         channel: self.selected_channel,
                         volume_db: channel.volume_db,
-                    })?;
+                    });
                 }
             }
         }
-        Ok(())
     }
 
     /// Toggle mute on the selected channel
-    fn toggle_mute(&mut self) -> Result<()> {
+    fn toggle_mute(&mut self) {
         match self.selection_type {
             SelectionType::Input => {
                 if self.selected_channel < self.mixer_state.inputs.len() {
@@ -373,7 +380,7 @@ impl App {
                         !self.mixer_state.inputs[self.selected_channel].muted;
                     self.audio_engine.send_control(ControlMsg::ToggleInputMute {
                         channel: self.selected_channel,
-                    })?;
+                    });
                 }
             }
             SelectionType::Output => {
@@ -383,29 +390,27 @@ impl App {
                     self.audio_engine
                         .send_control(ControlMsg::ToggleOutputMute {
                             channel: self.selected_channel,
-                        })?;
+                        });
                 }
             }
         }
-        Ok(())
     }
 
     /// Toggle solo on the selected channel (input only)
-    fn toggle_solo(&mut self) -> Result<()> {
+    fn toggle_solo(&mut self) {
         if self.selection_type == SelectionType::Input {
             if self.selected_channel < self.mixer_state.inputs.len() {
                 self.mixer_state.inputs[self.selected_channel].soloed =
                     !self.mixer_state.inputs[self.selected_channel].soloed;
                 self.audio_engine.send_control(ControlMsg::ToggleInputSolo {
                     channel: self.selected_channel,
-                })?;
+                });
             }
         }
-        Ok(())
     }
 
     /// Reset volume of the selected channel to 0 dB
-    fn reset_volume_to_zero(&mut self) -> Result<()> {
+    fn reset_volume_to_zero(&mut self) {
         match self.selection_type {
             SelectionType::Input => {
                 if self.selected_channel < self.mixer_state.inputs.len() {
@@ -413,7 +418,7 @@ impl App {
                     self.audio_engine.send_control(ControlMsg::SetInputVolume {
                         channel: self.selected_channel,
                         volume_db: 0.0,
-                    })?;
+                    });
                 }
             }
             SelectionType::Output => {
@@ -422,11 +427,10 @@ impl App {
                     self.audio_engine.send_control(ControlMsg::SetOutputVolume {
                         channel: self.selected_channel,
                         volume_db: 0.0,
-                    })?;
+                    });
                 }
             }
         }
-        Ok(())
     }
 
     /// Render the UI
@@ -455,11 +459,25 @@ impl App {
 
     /// Render the title bar
     fn render_title(&self, frame: &mut Frame, area: Rect) {
-        let title = format!(" RMixer - {} ", self.client_name);
+        let mut title_spans = vec![Span::raw(format!(" RMixer - {} ", self.client_name))];
+
+        // Show a warning when the audio engine is no longer running
+        if self.audio_engine.is_dead() {
+            title_spans.push(Span::styled(
+                " AUDIO ENGINE STOPPED ",
+                Style::default().fg(Color::White).bg(Color::Red),
+            ));
+        } else if self.last_meter_update.elapsed() > ENGINE_STALL_TIMEOUT {
+            title_spans.push(Span::styled(
+                " NO AUDIO DATA ",
+                Style::default().fg(Color::Black).bg(Color::Yellow),
+            ));
+        }
+
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan))
-            .title(title);
+            .title(Line::from(title_spans));
         frame.render_widget(block, area);
     }
 
