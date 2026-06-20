@@ -279,12 +279,12 @@ impl ProcessHandler {
             match msg {
                 ControlMsg::SetInputVolume { channel, volume_db } => {
                     if channel < self.mixer_state.inputs.len() {
-                        self.mixer_state.inputs[channel].volume_db = volume_db;
+                        self.mixer_state.inputs[channel].set_volume_db(volume_db);
                     }
                 }
                 ControlMsg::SetOutputVolume { channel, volume_db } => {
                     if channel < self.mixer_state.outputs.len() {
-                        self.mixer_state.outputs[channel].volume_db = volume_db;
+                        self.mixer_state.outputs[channel].set_volume_db(volume_db);
                     }
                 }
                 ControlMsg::ToggleInputMute { channel } => {
@@ -356,7 +356,7 @@ impl jack::ProcessHandler for ProcessHandler {
             } else if any_soloed && !input_state.soloed {
                 0.0
             } else {
-                MeterData::db_to_linear(input_state.volume_db)
+                input_state.volume_linear()
             };
 
             let mut peaks = [0.0f32; 2];
