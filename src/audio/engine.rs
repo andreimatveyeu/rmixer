@@ -111,6 +111,12 @@ impl AudioEngine {
         let input_port_counts: Vec<usize> = config.inputs.iter().map(|c| c.port_count()).collect();
         let output_port_counts: Vec<usize> = config.outputs.iter().map(|c| c.port_count()).collect();
 
+        // Precompute the static routing once: for each global input port,
+        // the list of global output port indices it feeds. This mapping never
+        // changes at runtime, so deriving it here keeps the per-cycle mixing
+        // loop free of the branchy mono/stereo fan-out logic.
+        let input_routing = build_input_routing(&input_port_counts, &output_port_counts);
+
         // Pre-allocate one local mix buffer per output port so the process
         // callback never reads a JACK input buffer and writes a JACK output
         // buffer at the same time (JACK may alias them for zero-copy).
@@ -136,6 +142,7 @@ impl AudioEngine {
             output_ports,
             input_port_counts,
             output_port_counts,
+            input_routing,
             mixer_state,
             mix_buffers,
             meter_producer,
@@ -261,6 +268,40 @@ fn output_buffer<'a>(port: &'a mut Port<AudioOut>, ps: &'a ProcessScope) -> Opti
     }
 }
 
+/// Build the static input→output port routing table.
+///
+/// Returns, for each global input port index, the global output port indices
+/// it feeds. The fan-out rules mirror the original per-cycle logic:
+/// a mono input port feeds every output port; a stereo input port feeds the
+/// matching-position output port of each output channel.
+fn build_input_routing(
+    input_port_counts: &[usize],
+    output_port_counts: &[usize],
+) -> Vec<Vec<usize>> {
+    let mut routing = Vec::new();
+    for &port_count in input_port_counts {
+        for p in 0..port_count {
+            let mut targets = Vec::new();
+            let mut out_port_idx = 0;
+            for &out_port_count in output_port_counts {
+                for out_p in 0..out_port_count {
+                    let use_this_input = if port_count == 1 {
+                        true
+                    } else {
+                        p == out_p || (p == 0 && out_p >= port_count)
+                    };
+                    if use_this_input {
+                        targets.push(out_port_idx);
+                    }
+                    out_port_idx += 1;
+                }
+            }
+            routing.push(targets);
+        }
+    }
+    routing
+}
+
 /// JACK process handler - runs in the real-time audio thread
 struct ProcessHandler {
     /// Input ports
@@ -274,6 +315,10 @@ struct ProcessHandler {
 
     /// Number of ports per output channel
     output_port_counts: Vec<usize>,
+
+    /// For each global input port index, the global output port indices it
+    /// contributes to. Precomputed once since the routing is static.
+    input_routing: Vec<Vec<usize>>,
 
     /// Mixer state with gains, mute, solo
     mixer_state: MixerState,
@@ -424,29 +469,11 @@ impl jack::ProcessHandler for ProcessHandler {
 
                 if input_gain != 0.0 {
                     // Accumulate this input into the mix buffer of every
-                    // output port it maps to
-                    let mut out_port_idx = 0;
-                    for &out_port_count in self.output_port_counts.iter() {
-                        for out_p in 0..out_port_count {
-                            // Determine which input port maps to this output port
-                            // For mono input -> stereo output: use same input for both
-                            // For stereo input -> stereo output: use matching channels
-                            let use_this_input = if port_count == 1 {
-                                // Mono input goes to all output ports
-                                true
-                            } else {
-                                // Stereo input: left->left, right->right
-                                p == out_p || (p == 0 && out_p >= port_count)
-                            };
-
-                            if use_this_input {
-                                let mix = &mut self.mix_buffers[out_port_idx];
-                                for (m, in_s) in mix[..n_frames].iter_mut().zip(in_samples.iter())
-                                {
-                                    *m += in_s * input_gain;
-                                }
-                            }
-                            out_port_idx += 1;
+                    // output port it maps to, using the precomputed routing.
+                    for &out_port_idx in &self.input_routing[in_port_idx] {
+                        let mix = &mut self.mix_buffers[out_port_idx];
+                        for (m, in_s) in mix[..n_frames].iter_mut().zip(in_samples.iter()) {
+                            *m += in_s * input_gain;
                         }
                     }
                 }
@@ -508,5 +535,42 @@ impl jack::ProcessHandler for ProcessHandler {
             buf.resize(size as usize, 0.0);
         }
         Control::Continue
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_input_routing;
+
+    #[test]
+    fn mono_input_feeds_every_output_port() {
+        // One mono input, one stereo output: the single input port feeds both.
+        assert_eq!(build_input_routing(&[1], &[2]), vec![vec![0, 1]]);
+    }
+
+    #[test]
+    fn stereo_input_feeds_matching_output_ports() {
+        // Stereo input into stereo output: left->left, right->right.
+        assert_eq!(build_input_routing(&[2], &[2]), vec![vec![0], vec![1]]);
+    }
+
+    #[test]
+    fn stereo_input_into_mono_output_uses_left_only() {
+        // Preserves existing behavior: only the left port reaches a mono output.
+        assert_eq!(build_input_routing(&[2], &[1]), vec![vec![0], vec![]]);
+    }
+
+    #[test]
+    fn mixed_channels_index_output_ports_globally() {
+        // Mono + stereo inputs feeding two stereo outputs (ports 0,1 and 2,3).
+        let routing = build_input_routing(&[1, 2], &[2, 2]);
+        assert_eq!(
+            routing,
+            vec![
+                vec![0, 1, 2, 3], // mono input -> all output ports
+                vec![0, 2],       // stereo-left -> left of each output
+                vec![1, 3],       // stereo-right -> right of each output
+            ]
+        );
     }
 }
