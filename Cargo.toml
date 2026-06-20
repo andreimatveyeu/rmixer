@@ -3,6 +3,10 @@ name = "rmixer"
 version = "0.1.0"
 edition = "2021"
 
+[profile.release]
+lto = true
+codegen-units = 1
+
 [dependencies]
 jack = "0.13"
 ratatui = "0.29"
