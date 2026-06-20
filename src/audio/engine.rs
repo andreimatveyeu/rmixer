@@ -19,6 +19,12 @@ const METER_RING_BUFFER_SIZE: usize = 1024;
 /// Size of the ring buffer for control messages
 const CONTROL_RING_BUFFER_SIZE: usize = 64;
 
+/// How often meter data is flushed to the UI, in Hz. The process callback
+/// runs far more often than this (hundreds of times per second at small
+/// buffer sizes), so peaks are accumulated between flushes and pushed at
+/// roughly this rate, comfortably above the UI's redraw rate.
+const METER_UPDATE_HZ: usize = 60;
+
 /// Audio engine that manages JACK connections and processing
 pub struct AudioEngine {
     /// JACK async client handle
@@ -113,6 +119,17 @@ impl AudioEngine {
             .map(|_| vec![0.0; buffer_size])
             .collect();
 
+        // Meter accumulation state. Channels are indexed inputs-then-outputs,
+        // matching `MeterData::channel_index`. Peaks are folded in every cycle
+        // and flushed to the UI every `meter_interval_frames` frames.
+        let meter_port_counts: Vec<usize> = input_port_counts
+            .iter()
+            .chain(output_port_counts.iter())
+            .copied()
+            .collect();
+        let meter_accum = vec![[0.0f32; 2]; meter_port_counts.len()];
+        let meter_interval_frames = (client.sample_rate() as usize / METER_UPDATE_HZ).max(1);
+
         // Create process handler
         let process_handler = ProcessHandler {
             input_ports,
@@ -122,6 +139,10 @@ impl AudioEngine {
             mixer_state,
             mix_buffers,
             meter_producer,
+            meter_accum,
+            meter_port_counts,
+            meter_interval_frames,
+            frames_since_meter: 0,
             control_consumer,
             quit_flag: quit_flag.clone(),
         };
@@ -265,6 +286,19 @@ struct ProcessHandler {
     /// Producer for sending meter data to UI
     meter_producer: Producer<MeterData>,
 
+    /// Per-channel peak accumulator (inputs then outputs), holding the max
+    /// peak seen since the last flush so transients between flushes survive.
+    meter_accum: Vec<[f32; 2]>,
+
+    /// Port count per channel (inputs then outputs), for building MeterData.
+    meter_port_counts: Vec<usize>,
+
+    /// Flush accumulated meters to the UI after this many frames.
+    meter_interval_frames: usize,
+
+    /// Frames accumulated since the last meter flush.
+    frames_since_meter: usize,
+
     /// Consumer for receiving control messages from UI
     control_consumer: Consumer<ControlMsg>,
 
@@ -318,6 +352,24 @@ impl ProcessHandler {
             .iter()
             .map(|s| s.abs())
             .fold(0.0_f32, |a, b| a.max(b))
+    }
+
+    /// Push accumulated per-channel peaks to the UI and reset the accumulator.
+    fn flush_meters(&mut self) {
+        for (channel_index, (peaks, &port_count)) in self
+            .meter_accum
+            .iter_mut()
+            .zip(self.meter_port_counts.iter())
+            .enumerate()
+        {
+            let _ = self.meter_producer.push(MeterData {
+                channel_index,
+                peaks: *peaks,
+                port_count,
+            });
+            *peaks = [0.0; 2];
+        }
+        self.frames_since_meter = 0;
     }
 }
 
@@ -402,13 +454,10 @@ impl jack::ProcessHandler for ProcessHandler {
                 in_port_idx += 1;
             }
 
-            // Send meter data for this input channel
-            let meter = MeterData {
-                channel_index: ch_idx,
-                peaks,
-                port_count,
-            };
-            let _ = self.meter_producer.push(meter);
+            // Accumulate this input channel's peaks until the next flush.
+            for p in 0..port_count {
+                self.meter_accum[ch_idx][p] = self.meter_accum[ch_idx][p].max(peaks[p]);
+            }
         }
 
         // Phase 2: apply output gains, copy the mix buffers to the JACK
@@ -435,12 +484,18 @@ impl jack::ProcessHandler for ProcessHandler {
                 out_port_idx += 1;
             }
 
-            let meter = MeterData {
-                channel_index: num_inputs + ch_idx,
-                peaks,
-                port_count,
-            };
-            let _ = self.meter_producer.push(meter);
+            // Accumulate this output channel's peaks until the next flush.
+            for p in 0..port_count {
+                self.meter_accum[num_inputs + ch_idx][p] =
+                    self.meter_accum[num_inputs + ch_idx][p].max(peaks[p]);
+            }
+        }
+
+        // Flush accumulated meters to the UI at roughly METER_UPDATE_HZ,
+        // instead of pushing every (much shorter) process cycle.
+        self.frames_since_meter += n_frames;
+        if self.frames_since_meter >= self.meter_interval_frames {
+            self.flush_meters();
         }
 
         Control::Continue
