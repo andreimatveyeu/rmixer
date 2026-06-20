@@ -30,8 +30,9 @@ use super::widgets::ChannelStrip;
 /// Peak hold duration in seconds
 const PEAK_HOLD_DURATION: f32 = 5.0;
 
-/// Target frame rate
-const TARGET_FPS: u64 = 60;
+/// Target frame rate. Level meters do not benefit from more than ~30 fps,
+/// so this halves idle UI redraw cost versus 60 fps.
+const TARGET_FPS: u64 = 30;
 
 /// How long the meter stream may be silent before the audio engine is
 /// considered stalled (it normally sends meter data every process cycle)
