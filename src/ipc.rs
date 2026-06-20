@@ -77,6 +77,10 @@ pub struct ChannelState {
     /// Current volume in dB (-60 to +12)
     pub volume_db: f32,
 
+    /// Cached linear gain matching `volume_db`, so the real-time audio
+    /// callback never has to call `powf`. Kept in sync via `set_volume_db`.
+    volume_linear: f32,
+
     /// Whether the channel is muted
     pub muted: bool,
 
@@ -101,6 +105,7 @@ impl ChannelState {
             name,
             port_count,
             volume_db: VOLUME_DEFAULT_DB,
+            volume_linear: MeterData::db_to_linear(VOLUME_DEFAULT_DB),
             muted: false,
             soloed: false,
             current_peaks: [0.0; 2],
@@ -130,9 +135,20 @@ impl ChannelState {
         }
     }
 
+    /// Set volume in dB (clamped), refreshing the cached linear gain.
+    pub fn set_volume_db(&mut self, db: f32) {
+        self.volume_db = db.clamp(VOLUME_MIN_DB, VOLUME_MAX_DB);
+        self.volume_linear = MeterData::db_to_linear(self.volume_db);
+    }
+
     /// Adjust volume by delta, clamping to valid range
     pub fn adjust_volume(&mut self, delta_db: f32) {
-        self.volume_db = (self.volume_db + delta_db).clamp(VOLUME_MIN_DB, VOLUME_MAX_DB);
+        self.set_volume_db(self.volume_db + delta_db);
+    }
+
+    /// Cached linear gain for `volume_db` (ignores mute/solo).
+    pub fn volume_linear(&self) -> f32 {
+        self.volume_linear
     }
 
     /// Get volume as linear gain
@@ -140,7 +156,7 @@ impl ChannelState {
         if self.muted {
             0.0
         } else {
-            MeterData::db_to_linear(self.volume_db)
+            self.volume_linear
         }
     }
 }

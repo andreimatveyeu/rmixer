@@ -86,7 +86,7 @@ impl App {
             .map(|c| {
                 let mut state = ChannelState::new(c.name.clone(), c.port_count());
                 if let Some(vol) = c.volume_db {
-                    state.volume_db = vol.clamp(-60.0, 12.0);
+                    state.set_volume_db(vol);
                 }
                 state
             })
@@ -98,7 +98,7 @@ impl App {
             .map(|c| {
                 let mut state = ChannelState::new(c.name.clone(), c.port_count());
                 if let Some(vol) = c.volume_db {
-                    state.volume_db = vol.clamp(-60.0, 12.0);
+                    state.set_volume_db(vol);
                 }
                 state
             })
@@ -414,7 +414,7 @@ impl App {
         match self.selection_type {
             SelectionType::Input => {
                 if self.selected_channel < self.mixer_state.inputs.len() {
-                    self.mixer_state.inputs[self.selected_channel].volume_db = 0.0;
+                    self.mixer_state.inputs[self.selected_channel].set_volume_db(0.0);
                     self.audio_engine.send_control(ControlMsg::SetInputVolume {
                         channel: self.selected_channel,
                         volume_db: 0.0,
@@ -423,7 +423,7 @@ impl App {
             }
             SelectionType::Output => {
                 if self.selected_channel < self.mixer_state.outputs.len() {
-                    self.mixer_state.outputs[self.selected_channel].volume_db = 0.0;
+                    self.mixer_state.outputs[self.selected_channel].set_volume_db(0.0);
                     self.audio_engine.send_control(ControlMsg::SetOutputVolume {
                         channel: self.selected_channel,
                         volume_db: 0.0,
