@@ -407,7 +407,6 @@ impl jack::ProcessHandler for ProcessHandler {
                 channel_index: ch_idx,
                 peaks,
                 port_count,
-                timestamp: std::time::Instant::now(),
             };
             let _ = self.meter_producer.push(meter);
         }
@@ -440,7 +439,6 @@ impl jack::ProcessHandler for ProcessHandler {
                 channel_index: num_inputs + ch_idx,
                 peaks,
                 port_count,
-                timestamp: std::time::Instant::now(),
             };
             let _ = self.meter_producer.push(meter);
         }

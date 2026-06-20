@@ -25,32 +25,9 @@ pub struct MeterData {
 
     /// Number of valid peaks (1 for mono, 2 for stereo)
     pub port_count: usize,
-
-    /// Timestamp when this measurement was taken
-    pub timestamp: Instant,
 }
 
 impl MeterData {
-    /// Create new meter data for a mono channel
-    pub fn mono(channel_index: usize, peak: f32) -> Self {
-        Self {
-            channel_index,
-            peaks: [peak, 0.0],
-            port_count: 1,
-            timestamp: Instant::now(),
-        }
-    }
-
-    /// Create new meter data for a stereo channel
-    pub fn stereo(channel_index: usize, peak_l: f32, peak_r: f32) -> Self {
-        Self {
-            channel_index,
-            peaks: [peak_l, peak_r],
-            port_count: 2,
-            timestamp: Instant::now(),
-        }
-    }
-
     /// Convert a linear peak value to dB
     pub fn linear_to_db(linear: f32) -> f32 {
         if linear <= 0.0 {
