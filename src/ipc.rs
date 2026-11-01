@@ -1,9 +1,11 @@
 //! Inter-process communication types for rmixer
 //!
 //! Defines lock-free communication structures between the audio thread
-//! and the UI thread for real-time safe operation.
+//! and the mixer core and UI, for real-time safe operation.
 
 use std::time::Instant;
+
+use crate::config::{ChannelConfig, Config};
 
 /// Volume limits in dB
 pub const VOLUME_MIN_DB: f32 = -60.0;
@@ -43,7 +45,17 @@ impl MeterData {
     }
 }
 
-/// Control message sent from UI thread to audio thread
+/// Whether a channel is an input or an output
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelKind {
+    Input,
+    Output,
+}
+
+/// Control message sent from the mixer core to the audio thread.
+///
+/// Every message carries an absolute value, so its effect does not depend on
+/// the state of the audio thread when it arrives.
 #[derive(Debug, Clone, Copy)]
 pub enum ControlMsg {
     /// Set volume for an input channel (index, volume in dB)
@@ -52,17 +64,14 @@ pub enum ControlMsg {
     /// Set volume for an output channel (index, volume in dB)
     SetOutputVolume { channel: usize, volume_db: f32 },
 
-    /// Toggle mute for an input channel
-    ToggleInputMute { channel: usize },
+    /// Set mute for an input channel
+    SetInputMute { channel: usize, muted: bool },
 
-    /// Toggle mute for an output channel
-    ToggleOutputMute { channel: usize },
+    /// Set mute for an output channel
+    SetOutputMute { channel: usize, muted: bool },
 
-    /// Toggle solo for an input channel
-    ToggleInputSolo { channel: usize },
-
-    /// Request to quit the audio engine
-    Quit,
+    /// Set solo for an input channel
+    SetInputSolo { channel: usize, soloed: bool },
 }
 
 /// State of a single channel (shared representation for UI)
@@ -114,6 +123,24 @@ impl ChannelState {
         }
     }
 
+    /// Create a channel state from its configuration, restoring the saved
+    /// volume if there is one.
+    fn from_config(config: &ChannelConfig) -> Self {
+        let mut state = Self::new(config.name.clone(), config.port_count());
+        if let Some(volume_db) = config.volume_db {
+            state.set_volume_db(volume_db);
+        }
+        state
+    }
+
+    /// Copy volume, mute and solo from `other`, leaving the meters alone.
+    pub fn copy_settings_from(&mut self, other: &ChannelState) {
+        self.volume_db = other.volume_db;
+        self.volume_linear = other.volume_linear;
+        self.muted = other.muted;
+        self.soloed = other.soloed;
+    }
+
     /// Update meter data with new peaks
     pub fn update_meter(&mut self, peaks: [f32; 2], peak_hold_duration_secs: f32) {
         let now = Instant::now();
@@ -141,11 +168,6 @@ impl ChannelState {
         self.volume_linear = MeterData::db_to_linear(self.volume_db);
     }
 
-    /// Adjust volume by delta, clamping to valid range
-    pub fn adjust_volume(&mut self, delta_db: f32) {
-        self.set_volume_db(self.volume_db + delta_db);
-    }
-
     /// Cached linear gain for `volume_db` (ignores mute/solo).
     pub fn volume_linear(&self) -> f32 {
         self.volume_linear
@@ -169,6 +191,54 @@ pub struct MixerState {
 }
 
 impl MixerState {
+    /// Build the initial state described by a configuration.
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            inputs: config.inputs.iter().map(ChannelState::from_config).collect(),
+            outputs: config.outputs.iter().map(ChannelState::from_config).collect(),
+        }
+    }
+
+    /// All channels of one kind.
+    pub fn channels(&self, kind: ChannelKind) -> &[ChannelState] {
+        match kind {
+            ChannelKind::Input => &self.inputs,
+            ChannelKind::Output => &self.outputs,
+        }
+    }
+
+    /// Apply a control message. Runs on the audio thread, so it must stay
+    /// lock-free and allocation-free. Invalid channel indices are ignored.
+    pub fn apply_control(&mut self, msg: ControlMsg) {
+        match msg {
+            ControlMsg::SetInputVolume { channel, volume_db } => {
+                if let Some(state) = self.inputs.get_mut(channel) {
+                    state.set_volume_db(volume_db);
+                }
+            }
+            ControlMsg::SetOutputVolume { channel, volume_db } => {
+                if let Some(state) = self.outputs.get_mut(channel) {
+                    state.set_volume_db(volume_db);
+                }
+            }
+            ControlMsg::SetInputMute { channel, muted } => {
+                if let Some(state) = self.inputs.get_mut(channel) {
+                    state.muted = muted;
+                }
+            }
+            ControlMsg::SetOutputMute { channel, muted } => {
+                if let Some(state) = self.outputs.get_mut(channel) {
+                    state.muted = muted;
+                }
+            }
+            ControlMsg::SetInputSolo { channel, soloed } => {
+                if let Some(state) = self.inputs.get_mut(channel) {
+                    state.soloed = soloed;
+                }
+            }
+        }
+    }
+
     /// Check if any input channel is soloed
     pub fn any_input_soloed(&self) -> bool {
         self.inputs.iter().any(|ch| ch.soloed)
