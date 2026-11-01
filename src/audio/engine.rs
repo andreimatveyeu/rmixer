@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::config::Config;
-use crate::ipc::{ChannelState, ControlMsg, MeterData, MixerState};
+use crate::ipc::{ControlMsg, MeterData, MixerState};
 
 /// Size of the ring buffer for meter data
 const METER_RING_BUFFER_SIZE: usize = 1024;
@@ -30,9 +30,6 @@ pub struct AudioEngine {
     /// JACK async client handle
     _async_client: jack::AsyncClient<Notifications, ProcessHandler>,
 
-    /// Producer for sending control messages to audio thread
-    control_producer: Producer<ControlMsg>,
-
     /// Consumer for receiving meter data from audio thread
     meter_consumer: Consumer<MeterData>,
 
@@ -44,8 +41,11 @@ pub struct AudioEngine {
 }
 
 impl AudioEngine {
-    /// Create and start the audio engine
-    pub fn new(config: Config) -> Result<Self> {
+    /// Create and start the audio engine.
+    ///
+    /// Also returns the producer side of the control queue, which belongs to
+    /// the mixer core: it is the only component that sends control messages.
+    pub fn new(config: Config) -> Result<(Self, Producer<ControlMsg>)> {
         // Create ring buffers for communication
         let (meter_producer, meter_consumer) = RingBuffer::new(METER_RING_BUFFER_SIZE);
         let (control_producer, control_consumer) = RingBuffer::new(CONTROL_RING_BUFFER_SIZE);
@@ -92,20 +92,8 @@ impl AudioEngine {
             output_ports.len()
         );
 
-        // Build mixer state
-        let inputs: Vec<ChannelState> = config
-            .inputs
-            .iter()
-            .map(|c| ChannelState::new(c.name.clone(), c.port_count()))
-            .collect();
-
-        let outputs: Vec<ChannelState> = config
-            .outputs
-            .iter()
-            .map(|c| ChannelState::new(c.name.clone(), c.port_count()))
-            .collect();
-
-        let mixer_state = MixerState { inputs, outputs };
+        // Build mixer state, starting from the same state as the mixer core
+        let mixer_state = MixerState::from_config(&config);
 
         // Build port mapping info
         let input_port_counts: Vec<usize> = config.inputs.iter().map(|c| c.port_count()).collect();
@@ -166,24 +154,14 @@ impl AudioEngine {
 
         log::info!("JACK client activated");
 
-        Ok(Self {
+        let engine = Self {
             _async_client: async_client,
-            control_producer,
             meter_consumer,
             quit_flag,
             dead_flag,
-        })
-    }
+        };
 
-    /// Send a control message to the audio thread.
-    ///
-    /// Failures are logged rather than fatal: the queue can only fill up if
-    /// the audio thread stopped draining it (e.g. the JACK client died), and
-    /// dropping a UI control message is harmless in that situation.
-    pub fn send_control(&mut self, msg: ControlMsg) {
-        if self.control_producer.push(msg).is_err() {
-            log::warn!("Control message queue full; dropping message (audio engine stalled?)");
-        }
+        Ok((engine, control_producer))
     }
 
     /// Try to receive meter data from the audio thread
@@ -199,7 +177,6 @@ impl AudioEngine {
     /// Request the audio engine to quit
     pub fn quit(&mut self) {
         self.quit_flag.store(true, Ordering::SeqCst);
-        self.send_control(ControlMsg::Quit);
     }
 }
 
@@ -344,7 +321,7 @@ struct ProcessHandler {
     /// Frames accumulated since the last meter flush.
     frames_since_meter: usize,
 
-    /// Consumer for receiving control messages from UI
+    /// Consumer for receiving control messages from the mixer core
     control_consumer: Consumer<ControlMsg>,
 
     /// Quit flag reference
@@ -352,42 +329,10 @@ struct ProcessHandler {
 }
 
 impl ProcessHandler {
-    /// Process control messages from UI
+    /// Process control messages from the mixer core
     fn process_control_messages(&mut self) {
         while let Ok(msg) = self.control_consumer.pop() {
-            match msg {
-                ControlMsg::SetInputVolume { channel, volume_db } => {
-                    if channel < self.mixer_state.inputs.len() {
-                        self.mixer_state.inputs[channel].set_volume_db(volume_db);
-                    }
-                }
-                ControlMsg::SetOutputVolume { channel, volume_db } => {
-                    if channel < self.mixer_state.outputs.len() {
-                        self.mixer_state.outputs[channel].set_volume_db(volume_db);
-                    }
-                }
-                ControlMsg::ToggleInputMute { channel } => {
-                    if channel < self.mixer_state.inputs.len() {
-                        self.mixer_state.inputs[channel].muted =
-                            !self.mixer_state.inputs[channel].muted;
-                    }
-                }
-                ControlMsg::ToggleOutputMute { channel } => {
-                    if channel < self.mixer_state.outputs.len() {
-                        self.mixer_state.outputs[channel].muted =
-                            !self.mixer_state.outputs[channel].muted;
-                    }
-                }
-                ControlMsg::ToggleInputSolo { channel } => {
-                    if channel < self.mixer_state.inputs.len() {
-                        self.mixer_state.inputs[channel].soloed =
-                            !self.mixer_state.inputs[channel].soloed;
-                    }
-                }
-                ControlMsg::Quit => {
-                    self.quit_flag.store(true, Ordering::SeqCst);
-                }
-            }
+            self.mixer_state.apply_control(msg);
         }
     }
 

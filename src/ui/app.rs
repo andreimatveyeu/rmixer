@@ -22,7 +22,8 @@ use ratatui::{
 
 use crate::audio::AudioEngine;
 use crate::config::Config;
-use crate::ipc::{ChannelState, ControlMsg, MixerState, VOLUME_STEP_DB};
+use crate::ipc::{ChannelKind, ChannelState, MixerState, VOLUME_STEP_DB};
+use crate::mixer::{ChannelUpdate, CoreError, MixerCore, SharedCore, VolumeChange};
 
 use super::widgets::ChannelStrip;
 
@@ -50,7 +51,12 @@ pub struct App {
     /// Audio engine handle
     audio_engine: AudioEngine,
 
-    /// Mixer state (mirrors audio thread state for UI)
+    /// Mixer core, the source of truth for volume, mute and solo. Shared
+    /// with the API server when it is enabled.
+    core: SharedCore,
+
+    /// What the UI draws. Settings are copied from the core once per frame
+    /// and never changed here; the meters are only ever updated here.
     mixer_state: MixerState,
 
     /// Currently selected channel index
@@ -80,56 +86,15 @@ impl App {
     pub fn new(config: Config) -> Result<Self> {
         let client_name = config.client_name.clone();
 
-        // Initialize channel states with saved volumes
-        let inputs: Vec<ChannelState> = config
-            .inputs
-            .iter()
-            .map(|c| {
-                let mut state = ChannelState::new(c.name.clone(), c.port_count());
-                if let Some(vol) = c.volume_db {
-                    state.set_volume_db(vol);
-                }
-                state
-            })
-            .collect();
-
-        let outputs: Vec<ChannelState> = config
-            .outputs
-            .iter()
-            .map(|c| {
-                let mut state = ChannelState::new(c.name.clone(), c.port_count());
-                if let Some(vol) = c.volume_db {
-                    state.set_volume_db(vol);
-                }
-                state
-            })
-            .collect();
-
-        let mixer_state = MixerState { inputs, outputs };
-
-        // Create audio engine
-        let mut audio_engine = AudioEngine::new(config.clone())?;
-        
-        // Send initial volume levels to audio thread
-        for (i, c) in config.inputs.iter().enumerate() {
-            if let Some(vol) = c.volume_db {
-                audio_engine.send_control(ControlMsg::SetInputVolume {
-                    channel: i,
-                    volume_db: vol.clamp(-60.0, 12.0),
-                });
-            }
-        }
-        for (i, c) in config.outputs.iter().enumerate() {
-            if let Some(vol) = c.volume_db {
-                audio_engine.send_control(ControlMsg::SetOutputVolume {
-                    channel: i,
-                    volume_db: vol.clamp(-60.0, 12.0),
-                });
-            }
-        }
+        // Create audio engine and the core that controls it. Both start
+        // from the volumes in the config, so nothing needs sending yet.
+        let (audio_engine, control_producer) = AudioEngine::new(config.clone())?;
+        let mixer_state = MixerState::from_config(&config);
+        let core = SharedCore::new(MixerCore::new(mixer_state.clone(), control_producer));
 
         Ok(Self {
             audio_engine,
+            core,
             mixer_state,
             selected_channel: 0,
             selection_type: SelectionType::Input,
@@ -139,6 +104,11 @@ impl App {
             client_name,
             config,
         })
+    }
+
+    /// Handle to the mixer core, for the API server
+    pub fn core(&self) -> SharedCore {
+        self.core.clone()
     }
 
     /// Run the main application loop
@@ -172,9 +142,14 @@ impl App {
     
     /// Save current volume levels to config file
     fn save_volumes(&mut self) {
-        let input_volumes: Vec<f32> = self.mixer_state.inputs.iter().map(|c| c.volume_db).collect();
-        let output_volumes: Vec<f32> = self.mixer_state.outputs.iter().map(|c| c.volume_db).collect();
-        
+        // Close the core first, so that no later API request can report
+        // success for a change that will not be saved.
+        let (input_volumes, output_volumes) = {
+            let mut core = self.core.lock();
+            core.close();
+            (core.volumes(ChannelKind::Input), core.volumes(ChannelKind::Output))
+        };
+
         self.config.update_volumes(&input_volumes, &output_volumes);
         
         if let Err(e) = self.config.save() {
@@ -189,6 +164,9 @@ impl App {
         while !self.should_quit {
             // Process meter updates from audio thread
             self.process_meter_updates();
+
+            // Pick up changes made through the API or the key handlers
+            self.core.lock().copy_settings_to(&mut self.mixer_state);
 
             // Draw UI
             terminal.draw(|f| self.render(f))?;
@@ -346,92 +324,55 @@ impl App {
         }
     }
 
+    /// The kind of the selected channel
+    fn selected_kind(&self) -> ChannelKind {
+        match self.selection_type {
+            SelectionType::Input => ChannelKind::Input,
+            SelectionType::Output => ChannelKind::Output,
+        }
+    }
+
+    /// Report the outcome of a change to the selected channel. On failure
+    /// the core is unchanged, so the screen stays correct and the key press
+    /// simply has no effect. A full queue means the audio thread has stopped
+    /// draining it, which the title bar already reports. Nothing is logged,
+    /// as stderr output would garble the UI.
+    fn ignore_failure(result: Result<(), CoreError>) {
+        let _ = result;
+    }
+
     /// Adjust volume of the selected channel
     fn adjust_volume(&mut self, delta: f32) {
-        match self.selection_type {
-            SelectionType::Input => {
-                if self.selected_channel < self.mixer_state.inputs.len() {
-                    let channel = &mut self.mixer_state.inputs[self.selected_channel];
-                    channel.adjust_volume(delta);
-                    self.audio_engine.send_control(ControlMsg::SetInputVolume {
-                        channel: self.selected_channel,
-                        volume_db: channel.volume_db,
-                    });
-                }
-            }
-            SelectionType::Output => {
-                if self.selected_channel < self.mixer_state.outputs.len() {
-                    let channel = &mut self.mixer_state.outputs[self.selected_channel];
-                    channel.adjust_volume(delta);
-                    self.audio_engine.send_control(ControlMsg::SetOutputVolume {
-                        channel: self.selected_channel,
-                        volume_db: channel.volume_db,
-                    });
-                }
-            }
-        }
+        let update = ChannelUpdate {
+            volume: Some(VolumeChange::Delta(delta)),
+            ..Default::default()
+        };
+        let (kind, index) = (self.selected_kind(), self.selected_channel);
+        Self::ignore_failure(self.core.lock().update(kind, index, update));
     }
 
     /// Toggle mute on the selected channel
     fn toggle_mute(&mut self) {
-        match self.selection_type {
-            SelectionType::Input => {
-                if self.selected_channel < self.mixer_state.inputs.len() {
-                    self.mixer_state.inputs[self.selected_channel].muted =
-                        !self.mixer_state.inputs[self.selected_channel].muted;
-                    self.audio_engine.send_control(ControlMsg::ToggleInputMute {
-                        channel: self.selected_channel,
-                    });
-                }
-            }
-            SelectionType::Output => {
-                if self.selected_channel < self.mixer_state.outputs.len() {
-                    self.mixer_state.outputs[self.selected_channel].muted =
-                        !self.mixer_state.outputs[self.selected_channel].muted;
-                    self.audio_engine
-                        .send_control(ControlMsg::ToggleOutputMute {
-                            channel: self.selected_channel,
-                        });
-                }
-            }
-        }
+        let (kind, index) = (self.selected_kind(), self.selected_channel);
+        Self::ignore_failure(self.core.lock().toggle_muted(kind, index));
     }
 
     /// Toggle solo on the selected channel (input only)
     fn toggle_solo(&mut self) {
         if self.selection_type == SelectionType::Input {
-            if self.selected_channel < self.mixer_state.inputs.len() {
-                self.mixer_state.inputs[self.selected_channel].soloed =
-                    !self.mixer_state.inputs[self.selected_channel].soloed;
-                self.audio_engine.send_control(ControlMsg::ToggleInputSolo {
-                    channel: self.selected_channel,
-                });
-            }
+            let index = self.selected_channel;
+            Self::ignore_failure(self.core.lock().toggle_soloed(index));
         }
     }
 
     /// Reset volume of the selected channel to 0 dB
     fn reset_volume_to_zero(&mut self) {
-        match self.selection_type {
-            SelectionType::Input => {
-                if self.selected_channel < self.mixer_state.inputs.len() {
-                    self.mixer_state.inputs[self.selected_channel].set_volume_db(0.0);
-                    self.audio_engine.send_control(ControlMsg::SetInputVolume {
-                        channel: self.selected_channel,
-                        volume_db: 0.0,
-                    });
-                }
-            }
-            SelectionType::Output => {
-                if self.selected_channel < self.mixer_state.outputs.len() {
-                    self.mixer_state.outputs[self.selected_channel].set_volume_db(0.0);
-                    self.audio_engine.send_control(ControlMsg::SetOutputVolume {
-                        channel: self.selected_channel,
-                        volume_db: 0.0,
-                    });
-                }
-            }
-        }
+        let update = ChannelUpdate {
+            volume: Some(VolumeChange::Absolute(0.0)),
+            ..Default::default()
+        };
+        let (kind, index) = (self.selected_kind(), self.selected_channel);
+        Self::ignore_failure(self.core.lock().update(kind, index, update));
     }
 
     /// Render the UI
