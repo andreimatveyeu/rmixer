@@ -1,7 +1,7 @@
 client_name: rMixer
-# Enable the control API. rmixer then requires --api-key on the command line:
-# the key cannot be set here. Traffic is not encrypted: see the README before
-# binding anything other than a loopback address.
+# Enable the control API. rmixer then requires --api-key-file or --api-key on
+# the command line: the key cannot be set here. Traffic is not encrypted: see
+# the README before binding anything other than a loopback address.
 # api_listen: "127.0.0.1:7700"
 inputs:
 - name: Mic

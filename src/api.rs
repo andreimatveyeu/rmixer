@@ -12,13 +12,15 @@
 //! Clients learn about failures from the response instead.
 
 use std::fmt;
+use std::fs::File;
 use std::hint::black_box;
 use std::io::Read;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tiny_http::{Header, Request, Response, Server};
 
@@ -48,9 +50,9 @@ pub fn parse_listen_addr(spec: &str) -> Result<SocketAddr> {
     })
 }
 
-/// The key clients must present. It only ever comes from the command line,
-/// and has no `Display` or `Serialize` so that it cannot end up in a message,
-/// a response or the config file by accident.
+/// The key clients must present. It only ever comes from the command line or
+/// a key file, and has no `Display` or `Serialize` so that it cannot end up in
+/// a message, a response or the config file by accident.
 #[derive(Clone)]
 pub struct ApiKey(String);
 
@@ -91,6 +93,69 @@ fn constant_time_eq(secret: &[u8], presented: &[u8]) -> bool {
     difference == 0
 }
 
+/// Read the key from a file, which keeps it off the command line.
+///
+/// Surrounding whitespace, such as the newline that editors and `echo` add,
+/// is ignored: HTTP servers strip it from header values, so no client could
+/// send it anyway. Errors name the file but never show any of its content.
+pub fn read_key_file(path: &Path) -> Result<ApiKey> {
+    let read_error = || format!("Failed to read API key file {}", path.display());
+    let mut file = File::open(path).with_context(read_error)?;
+    let mut content = Vec::new();
+    file.read_to_end(&mut content).with_context(read_error)?;
+    let key = parse_key_file(path, content)?;
+    #[cfg(unix)]
+    warn_if_readable_by_others(path, &file);
+    Ok(key)
+}
+
+/// Take the key from the content of a key file. The error for invalid UTF-8
+/// is built here rather than passed on, as the original error holds the bytes.
+fn parse_key_file(path: &Path, content: Vec<u8>) -> Result<ApiKey> {
+    let Ok(content) = String::from_utf8(content) else {
+        bail!("API key file {} is not valid UTF-8", path.display());
+    };
+    let key = content.trim();
+    if key.is_empty() {
+        bail!("API key file {} is empty", path.display());
+    }
+    if key.contains(['\n', '\r']) {
+        bail!(
+            "API key file {} must hold the key on a single line",
+            path.display()
+        );
+    }
+    Ok(ApiKey(key.to_string()))
+}
+
+/// Warn when a key file can be read by users other than its owner. This is
+/// not an error, as sharing the file with a group, for example with a client
+/// running as another user, can be deliberate.
+#[cfg(unix)]
+fn warn_if_readable_by_others(path: &Path, file: &File) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(metadata) = file.metadata() else {
+        return;
+    };
+    let mode = metadata.permissions().mode() & 0o777;
+    if readable_by_others(mode) {
+        // Written before the TUI takes over the terminal
+        eprintln!(
+            "Warning: API key file {} can be read by users other than its owner \
+             (mode {:03o}): restrict it with chmod 600",
+            path.display(),
+            mode
+        );
+    }
+}
+
+/// Whether a file mode lets the group or others read the file
+#[cfg(unix)]
+fn readable_by_others(mode: u32) -> bool {
+    mode & 0o044 != 0
+}
+
 /// Check the API settings for this run, given the resolved listen address.
 /// Returns what the API needs to start, or `None` if it is disabled.
 pub fn check_api_settings(
@@ -100,10 +165,12 @@ pub fn check_api_settings(
     match (listen, key) {
         (None, None) => Ok(None),
         (None, Some(_)) => Err(anyhow!(
-            "--api-key was given but the API is not enabled: use --api-listen, \
-             or api_listen in the config file"
+            "An API key was given with --api-key or --api-key-file but the API \
+             is not enabled: use --api-listen, or api_listen in the config file"
         )),
-        (Some(_), None) => Err(anyhow!("The API is enabled but has no key: use --api-key")),
+        (Some(_), None) => Err(anyhow!(
+            "The API is enabled but has no key: use --api-key-file or --api-key"
+        )),
         (Some(_), Some(key)) if key.0.is_empty() => Err(anyhow!("--api-key must not be empty")),
         (Some(listen), Some(key)) => Ok(Some((listen, key))),
     }
@@ -445,8 +512,10 @@ mod tests {
     use crate::mixer::MixerCore;
     use rtrb::{Consumer, RingBuffer};
     use serde_json::{json, Value};
+    use std::fs;
     use std::io::Write;
     use std::net::TcpStream;
+    use std::path::PathBuf;
 
     const TEST_KEY: &str = "test-key";
 
@@ -844,6 +913,135 @@ mod tests {
         let error = check_api_settings(None, Some(test_key())).unwrap_err();
         assert!(error.to_string().contains("not enabled"));
         assert!(!error.to_string().contains(TEST_KEY));
+    }
+
+    /// A key file in the temporary directory, removed when dropped
+    struct KeyFile(PathBuf);
+
+    impl KeyFile {
+        fn new(name: &str, content: &[u8]) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "rmixer-test-{}-{}.key",
+                std::process::id(),
+                name
+            ));
+            fs::write(&path, content).unwrap();
+            Self(path)
+        }
+
+        fn read(&self) -> Result<ApiKey> {
+            read_key_file(&self.0)
+        }
+
+        /// The error for an invalid file, with its causes, checked to name
+        /// the file
+        fn error(&self) -> String {
+            let error = format!("{:#}", self.read().unwrap_err());
+            assert!(error.contains(&self.0.display().to_string()), "{error}");
+            error
+        }
+    }
+
+    impl Drop for KeyFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn key_file_without_a_newline_is_read() {
+        let file = KeyFile::new("no-newline", b"test-key");
+        assert_eq!(file.read().unwrap().0, TEST_KEY);
+    }
+
+    #[test]
+    fn trailing_newline_is_removed_from_a_key_file() {
+        let file = KeyFile::new("lf", b"test-key\n");
+        assert_eq!(file.read().unwrap().0, TEST_KEY);
+    }
+
+    #[test]
+    fn trailing_crlf_is_removed_from_a_key_file() {
+        let file = KeyFile::new("crlf", b"test-key\r\n");
+        assert_eq!(file.read().unwrap().0, TEST_KEY);
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_removed_from_a_key_file() {
+        let file = KeyFile::new("whitespace", b" \ttest key\n\n");
+        assert_eq!(file.read().unwrap().0, "test key");
+    }
+
+    #[test]
+    fn empty_key_file_is_an_error() {
+        let file = KeyFile::new("empty", b"");
+        assert!(file.error().contains("is empty"));
+    }
+
+    #[test]
+    fn key_file_with_only_whitespace_is_an_error() {
+        let file = KeyFile::new("blank", b" \r\n\n");
+        assert!(file.error().contains("is empty"));
+    }
+
+    #[test]
+    fn key_file_with_several_lines_is_an_error() {
+        let file = KeyFile::new("lines", b"test-key\nother-line\n");
+        let error = file.error();
+        assert!(error.contains("single line"), "{error}");
+        assert!(!error.contains(TEST_KEY) && !error.contains("other-line"));
+    }
+
+    #[test]
+    fn key_file_that_is_not_utf8_is_an_error() {
+        let file = KeyFile::new("not-utf8", b"test-key\xff\n");
+        let error = file.error();
+        assert!(error.contains("not valid UTF-8"), "{error}");
+        assert!(!error.contains(TEST_KEY), "{error}");
+    }
+
+    #[test]
+    fn missing_key_file_is_an_error_with_the_reason() {
+        let file = KeyFile::new("missing", b"");
+        fs::remove_file(&file.0).unwrap();
+        let error = file.read().unwrap_err();
+        let reason = error.root_cause().downcast_ref::<std::io::Error>().unwrap();
+        assert_eq!(reason.kind(), std::io::ErrorKind::NotFound);
+        let error = file.error();
+        assert!(error.contains("Failed to read API key file"), "{error}");
+        assert!(error.contains(&reason.to_string()), "{error}");
+    }
+
+    #[test]
+    fn unreadable_key_file_is_an_error_with_the_reason() {
+        // A directory can be opened but not read
+        let path = std::env::temp_dir();
+        let error = read_key_file(&path).unwrap_err();
+        let reason = error.root_cause().downcast_ref::<std::io::Error>().unwrap();
+        let error = format!("{error:#}");
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert!(error.contains(&reason.to_string()), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_or_other_read_access_is_detected() {
+        for mode in [0o600, 0o400, 0o700, 0o620, 0o602] {
+            assert!(!readable_by_others(mode), "{mode:o}");
+        }
+        for mode in [0o640, 0o604, 0o644, 0o444] {
+            assert!(readable_by_others(mode), "{mode:o}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_file_readable_by_others_is_still_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let file = KeyFile::new("shared", b"test-key\n");
+        fs::set_permissions(&file.0, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(file.read().unwrap().0, TEST_KEY);
     }
 
     /// A parsed HTTP response

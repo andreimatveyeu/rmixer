@@ -30,8 +30,8 @@ struct Args {
 
     /// Enable the control API, listening on ADDR (IP:PORT, or PORT for
     /// loopback). Without a value it listens on 127.0.0.1:7700. Requires
-    /// --api-key. Traffic is not encrypted, so only bind other addresses on a
-    /// trusted network.
+    /// --api-key-file or --api-key. Traffic is not encrypted, so only bind
+    /// other addresses on a trusted network.
     #[arg(
         long,
         value_name = "ADDR",
@@ -42,11 +42,17 @@ struct Args {
 
     /// Key that clients of the control API must send as `Authorization: Bearer
     /// <KEY>`. Required when the API is enabled. Other local users can see it
-    /// in the process list.
+    /// in the process list: prefer --api-key-file.
     // Values may start with a hyphen: clap would otherwise refuse such a key
     // with an error that prints the start of it.
     #[arg(long, value_name = "KEY", allow_hyphen_values = true)]
     api_key: Option<api::ApiKey>,
+
+    /// Read the API key from the file at PATH instead of --api-key, which
+    /// keeps it off the command line. Surrounding whitespace, such as a
+    /// trailing newline, is ignored.
+    #[arg(long, value_name = "PATH", conflicts_with = "api_key")]
+    api_key_file: Option<PathBuf>,
 
     /// Enable verbose logging
     #[arg(short, long)]
@@ -82,7 +88,11 @@ fn main() -> Result<()> {
     // for this run only: it is not written to the config file. Nor is the
     // key, which goes to the API server alone.
     let api_listen = args.api_listen.as_deref().or(config.api_listen.as_deref());
-    let api_server = api::check_api_settings(api_listen, args.api_key)?
+    let api_key = match &args.api_key_file {
+        Some(path) => Some(api::read_key_file(path)?),
+        None => args.api_key,
+    };
+    let api_server = api::check_api_settings(api_listen, api_key)?
         .map(|(listen, key)| {
             config.ensure_unique_channel_names()?;
             api::ApiServer::bind(api::parse_listen_addr(listen)?, key)
@@ -133,5 +143,24 @@ mod tests {
     fn repeated_api_key_error_does_not_print_it() {
         let error = parse(&["--api-key", "test-key", "--api-key", "test-key"]).unwrap_err();
         assert!(!error.to_string().contains("test-key"));
+    }
+
+    #[test]
+    fn api_key_file_is_taken_as_a_path() {
+        let args = parse(&["--api-key-file", "api-key"]).unwrap();
+        assert_eq!(args.api_key_file, Some(PathBuf::from("api-key")));
+        assert!(args.api_key.is_none());
+    }
+
+    #[test]
+    fn api_key_and_api_key_file_conflict_without_printing_the_key() {
+        for extra in [
+            ["--api-key", "test-key", "--api-key-file", "api-key"],
+            ["--api-key-file", "api-key", "--api-key", "test-key"],
+        ] {
+            let error = parse(&extra).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+            assert!(!error.to_string().contains("test-key"), "{error}");
+        }
     }
 }
