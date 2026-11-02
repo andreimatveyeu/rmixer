@@ -64,7 +64,8 @@ rmixer --config config.yaml
 
 - `-c, --config <PATH>`: Path to configuration file (required)
 - `--api-listen [<ADDR>]`: Enable the [control API](#control-api). Off by default
-- `--api-key <KEY>`: Key that API clients must send. Required when the API is enabled
+- `--api-key-file <PATH>`: Read the API key from a file. Either this or `--api-key` is required when the API is enabled
+- `--api-key <KEY>`: Key that API clients must send, given on the command line
 - `-v, --verbose`: Enable verbose logging
 - `-h, --help`: Print help
 - `-V, --version`: Print version
@@ -114,7 +115,7 @@ To enable the [control API](#control-api) from the config file, add a listen add
 api_listen: "127.0.0.1:7700"
 ```
 
-The API key cannot be set in the config file: pass it with `--api-key`.
+The API key cannot be set in the config file: pass it with `--api-key-file` or `--api-key`.
 
 ## Controls
 
@@ -148,11 +149,20 @@ Or use graphical tools like `qjackctl`, `qpwgraph`, or `helvum`.
 
 External clients can read and change channel settings over HTTP while the TUI is running. Changes from the API and the keyboard act on the same state, so the TUI shows API changes on the next frame, and volumes changed through the API are saved to the config file on exit like any others.
 
-The API runs inside the `rmixer` process and exits with it. It is off by default. Enable it with `--api-listen` or with `api_listen` in the config file; the command line takes precedence and is not written to the config file. Either way, you must also give an API key:
+The API runs inside the `rmixer` process and exits with it. It is off by default. Enable it with `--api-listen` or with `api_listen` in the config file; the command line takes precedence and is not written to the config file. Either way, you must also give an API key, preferably in a file that only you can read:
 
 ```bash
-rmixer --config config.yaml --api-listen --api-key "$RMIXER_API_KEY"
+mkdir -p ~/.config/rmixer
+touch ~/.config/rmixer/api-key
+chmod 600 ~/.config/rmixer/api-key
+openssl rand -hex 32 > ~/.config/rmixer/api-key
+
+rmixer --config config.yaml --api-listen --api-key-file ~/.config/rmixer/api-key
 ```
+
+`--api-key-file` keeps the key off the command line. The file must hold the key on a single line; surrounding whitespace, such as the trailing newline, is ignored. If the file can be read by its group or by others, rmixer prints a warning at startup but still uses it.
+
+You can also give the key itself with `--api-key "$RMIXER_API_KEY"`, but see [Security](#security). The two options cannot be combined.
 
 | Value | Listens on |
 |-------|------------|
@@ -160,7 +170,7 @@ rmixer --config config.yaml --api-listen --api-key "$RMIXER_API_KEY"
 | `PORT`, e.g. `8000` | `127.0.0.1:PORT` |
 | `IP:PORT`, e.g. `[::1]:8000` | That address |
 
-Host names are not accepted. With the API enabled, names must be unique within the inputs and within the outputs, because channels are addressed by name; rmixer refuses to start otherwise. rmixer also refuses to start if the address cannot be bound, if the API is enabled without a key or with an empty one, or if `--api-key` is given without the API being enabled.
+Host names are not accepted. With the API enabled, names must be unique within the inputs and within the outputs, because channels are addressed by name; rmixer refuses to start otherwise. rmixer also refuses to start if the address cannot be bound, if the API is enabled without a key or with an empty one, if `--api-key` or `--api-key-file` is given without the API being enabled, or if the key file cannot be read, is empty, is not valid UTF-8 or holds more than one line. Errors about the key file name the file but never show its content.
 
 ### Security
 
@@ -168,7 +178,7 @@ Host names are not accepted. With the API enabled, names must be unique within t
 
 **Traffic is not encrypted.** The API speaks plain HTTP, so the key and all requests can be read by anything that can see the traffic. The API listens on loopback unless you choose otherwise. Binding any other address, such as `0.0.0.0:7700`, sends the key over the network in the clear, and rmixer prints a warning at startup when you do. On untrusted networks, put a TLS proxy or VPN in front of the API.
 
-**A key on the command line is not private.** Other local users can see it in the process list, for example with `ps`, and it may land in your shell history. On a shared machine, assume that local users can learn the key.
+**A key on the command line is not private.** Other local users can see it in the process list, for example with `ps`, and it may land in your shell history or in the script that starts rmixer. Use `--api-key-file` instead, with the file readable only by you (`chmod 600`). On a shared machine where you must use `--api-key`, assume that local users can learn the key.
 
 The key is never written to the config file or to logs.
 
